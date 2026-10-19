@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import pymupdf
 from sentence_transformers import SentenceTransformer
+import numpy as np
 
 st.title("Computer Science Textbook Chatbot")
 
@@ -10,50 +11,58 @@ def load_model():
     return SentenceTransformer('all-MiniLM-L6-V2')
 
 model = load_model()
-st.success("AI Model is RUNNING!")
 
 os.makedirs("books", exist_ok=True)
 
-if "texts" not in st.session_state:
-    st.session_state.texts = {}
 if "chunks" not in st.session_state:
     st.session_state.chunks = []
-if "chunk_emb" not in st.session_state:
+    st.session_state.sources = []
     st.session_state.chunk_emb = None
 
-# Auto-load PDFs already in books folder
+# Load each book separately and take chunks from each
 book_files = [f for f in os.listdir("books") if f.endswith(".pdf")]
-if book_files and not st.session_state.texts:
-    for name in book_files:
-        path = os.path.join("books", name)
-        doc = pymupdf.open(path)
-        text = "".join([p.get_text() for p in doc])
-        st.session_state.texts[name] = text
-    st.info(f"Loaded {len(st.session_state.texts)} books from folder")
-
-# Index once
-if st.session_state.texts and st.session_state.chunk_emb is None:
-    with st.spinner("Indexing your books first time... please wait 30 sec"):
-        all_text = " ".join(st.session_state.texts.values())
-        # take first 400k chars to keep it fast
-        all_text = all_text[:400000]
-        st.session_state.chunks = [all_text[i:i+800] for i in range(0, len(all_text), 800)]
-        st.session_state.chunk_emb = model.encode(st.session_state.chunks)
-    st.success(f"Indexed {len(st.session_state.chunks)} pieces - Ready to answer!")
-
-uploaded = st.file_uploader("Upload MORE PDFs (optional)", type="pdf", accept_multiple_files=True)
-if uploaded:
-    st.warning("New files uploaded - press R to rerun to index them")
+if book_files and st.session_state.chunk_emb is None:
+    with st.spinner(f"Indexing {len(book_files)} books properly..."):
+        all_chunks = []
+        all_sources = []
+        for book_name in book_files:
+            doc = pymupdf.open(os.path.join("books", book_name))
+            book_text = ""
+            for i, page in enumerate(doc):
+                txt = page.get_text()
+                if i < 5 and "Copyright" in txt: continue
+                book_text += txt + "\n"
+            # Take 100 chunks from EACH book, not just first book
+            book_text = book_text[:120000] # 120k per book
+            chunks = [book_text[j:j+1000] for j in range(0, len(book_text), 800)]
+            for c in chunks:
+                if len(c) > 300 and "Copyright" not in c and "reproduced" not in c:
+                    all_chunks.append(c)
+                    all_sources.append(book_name)
+        
+        st.session_state.chunks = all_chunks
+        st.session_state.sources = all_sources
+        # IMPORTANT: normalize for real cosine similarity
+        st.session_state.chunk_emb = model.encode(all_chunks, normalize_embeddings=True)
+    st.success(f"Indexed {len(all_chunks)} chunks from {len(book_files)} books!")
 
 question = st.text_input("Ask a question from your books:")
+if question and st.session_state.chunk_emb is not None:
+    q_emb = model.encode([question], normalize_embeddings=True)
+    scores = (st.session_state.chunk_emb @ q_emb.T).flatten()
+    
+    # Get top 3 DIFFERENT chunks
+    top_idx = np.argsort(scores)[-3:][::-1]
+    
+    st.subheader("Answer from your textbooks:")
+    used_text = set()
+    for idx in top_idx:
+        txt = st.session_state.chunks[idx]
+        if txt[:100] not in used_text: # avoid duplicate same answer
+            st.markdown(f"**From {st.session_state.sources[idx]} | Score {scores[idx]:.2f}**")
+            st.write(txt)
+            st.divider()
+            used_text.add(txt[:100])
 
-if question:
-    if st.session_state.chunk_emb is None:
-        st.warning("No books indexed yet")
-    else:
-        q_emb = model.encode([question])
-        scores = (st.session_state.chunk_emb @ q_emb.T).flatten()
-        best = scores.argmax()
-        st.subheader("Answer from your textbooks:")
-        st.write(st.session_state.chunks[best])
-        st.caption(f"Score: {scores[best]:.2f}")
+    if max(scores) < 0.4:
+        st.warning("Low relevance - this topic may not be in your 4 books. Try: web development, vue.js, cloud, etc.")
